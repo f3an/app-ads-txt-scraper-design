@@ -5,19 +5,18 @@
 
 ## 1. Overall Architecture
 
-```
-┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
-│  Discovery Service  │     │  Orchestrator    │     │  Fetcher Workers    │
-│  (BullMQ queues)    │────►│  (BullMQ + Redis)│────►│  (stateless, HPA)   │
-│  AppStore + Play    │     │  rate_limit +    │     │  residential pool + │
-│  batchexecute/HTML  │     │  IP budget ceil  │     │  batchexecute/HTML  │
-└─────────────────────┘     └──────────────────┘     └─────────────────────┘
-         │                            │                            │
-         ▼                            ▼                            ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Postgres: apps, sites, domains, snapshots, events                      │
-│  S3/object storage: raw app-ads.txt (content-addressed by SHA-256)      │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    D["Discovery Service<br/>BullMQ queues<br/>AppStore + Play<br/>batchexecute/HTML"]
+    O["Orchestrator<br/>BullMQ + Redis<br/>rate_limit + IP budget ceiling"]
+    F["Fetcher Workers<br/>stateless, HPA<br/>residential pool +<br/>batchexecute/HTML"]
+    PG[("Postgres<br/>apps, sites, domains,<br/>snapshots, events")]
+    S3[("S3 / object storage<br/>raw app-ads.txt<br/>content-addressed SHA-256")]
+
+    D --> O --> F
+    D --> PG
+    F --> PG
+    F --> S3
 ```
 
 **Stack:** Node.js + Express (stateless API), Postgres (data), Redis (BullMQ + rate limiting), bull-board for queue inspection, Prometheus + Grafana for metrics.
@@ -28,6 +27,55 @@
 - **Daily** — fetch app-ads.txt from publisher sites → content_hash, status (OK/NOT_FOUND/UNREACHABLE/BLOCKED)
 
 ## 2. Database Schema
+
+```mermaid
+erDiagram
+    APPS }o--o| SITES : "site_id"
+    SITES }o--|| DOMAINS : "domain_id"
+    SITES ||--o{ SNAPSHOTS : "site_id"
+    APPS ||--o{ EVENTS : "bundle_id"
+    SITES ||--o{ EVENTS : "site_id"
+
+    APPS {
+        bigserial id PK
+        text bundle_id
+        text store
+        text status
+        text developer_name
+        bigint site_id FK
+        timestamptz next_check_at
+    }
+    SITES {
+        bigserial id PK
+        text subdomain
+        bigint domain_id FK
+        int fail_count
+        timestamptz next_check_at
+        timestamptz last_ok_at
+    }
+    DOMAINS {
+        bigserial id PK
+        text name
+        text status
+        int fail_count
+        timestamptz next_probe_at
+        int site_count
+    }
+    SNAPSHOTS {
+        bigserial id PK
+        bigint site_id FK
+        text content_hash
+        text status
+        timestamptz updated_at
+    }
+    EVENTS {
+        bigserial id PK
+        text bundle_id
+        bigint site_id
+        text event_type
+        timestamptz at
+    }
+```
 
 ### 2.1 apps
 
@@ -109,6 +157,15 @@ CREATE INDEX ON domains (next_probe_at) WHERE status <> 'OK';
 
 **Domain probe policy** (a separate lightweight job, not the daily fetch):
 
+```mermaid
+stateDiagram-v2
+    [*] --> OK
+    OK --> DOWN: 3 consecutive failed probes
+    DOWN --> OK: 2 consecutive successful probes
+    DOWN --> PARKED: DOWN 30+ days OR persistent NXDOMAIN
+    PARKED --> OK: manual reset or weekly discovery finds new URL
+```
+
 1. Probe = cheap two-step check:
    - DNS resolve (if NXDOMAIN → fail immediately, don't spend an HTTP request)
    - HEAD `https://<domain>/` with a 10s timeout. Any HTTP response (even 404/403) = domain is ALIVE — the file may be gone, but the host answers
@@ -175,6 +232,32 @@ Change history without bloating snapshots — for auditing and verification.
 
 ## 3. Discovery: weekly
 
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant PG as Postgres (apps)
+    participant W as Discovery Worker
+    participant MP as Marketplace (App Store / Play)
+    participant EV as Postgres (events)
+
+    S->>PG: claim batch (next_check_at <= now, FOR UPDATE SKIP LOCKED)
+    PG-->>W: batch of apps
+    W->>MP: lookup / fetch app page
+    MP-->>W: developer, website, status
+    alt no change
+        W->>PG: next_check_at = now() + 7d
+    else developer changed
+        W->>EV: OWNER_CHANGED
+        W->>PG: update developer_name, next_check_at
+    else URL changed
+        W->>EV: DOMAIN_CHANGED
+        W->>PG: upsert sites/domains, next_check_at
+    else app removed (404)
+        W->>EV: APP_REMOVED
+        W->>PG: status = REMOVED
+    end
+```
+
 ### 3.1 App Store
 
 ```
@@ -221,6 +304,35 @@ developerEmail:   ds:5 [1,2,69,1,0]
 ```
 
 ## 4. Fetching app-ads.txt: daily
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant PG as Postgres (sites+domains)
+    participant F as Fetcher Worker
+    participant R as Redis (rate limiter)
+    participant P as Publisher site
+    participant SN as Postgres (snapshots)
+
+    S->>PG: claim batch WHERE next_check_at<=now AND domain.status='OK'
+    PG-->>F: batch of sites (domain-gated)
+    F->>R: token bucket check (1 req/sec/domain)
+    R-->>F: ok
+    F->>P: GET https://[host]/app-ads.txt
+    P-->>F: 200 / 404 / timeout
+    alt 200 OK
+        F->>F: SHA-256(normalized body)
+        opt hash changed
+            F->>SN: insert snapshot (OK)
+        end
+        F->>PG: fail_count=0, next_check_at=+1d (jitter)
+    else 404
+        F->>SN: insert snapshot (NOT_FOUND)
+        F->>PG: next_check_at=+1d
+    else timeout/5xx
+        F->>PG: fail_count+=1, backoff, pull domains.next_probe_at forward
+    end
+```
 
 0. **Domain gate**: the claim query joins sites with domains and returns ONLY sites whose `domain.status = 'OK'`. No requests to /app-ads.txt for DOWN/PARKED domains — saving both us and the publisher:
 
